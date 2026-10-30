@@ -3,6 +3,7 @@ import { normalizeJid } from "@/lib/jid-utils";
 import { waManager } from "@/modules/whatsapp/manager";
 import { onMessageSent } from "@/lib/webhook";
 import Sticker from "wa-sticker-formatter";
+import { generateWAMessage } from "@whiskeysockets/baileys";
 import type { InteractiveMessagePayload, AlbumItem } from "./interactive";
 
 /**
@@ -328,7 +329,32 @@ export class ChatService {
             options.quoted = quotedOption;
         }
 
-        const sendResult = await instance.socket.sendMessage(jid, msgPayload, options);
+        let sendResult: any;
+        if (msgPayload.viewOnce && (msgPayload.image || msgPayload.video || msgPayload.audio)) {
+            // Baileys wraps `viewOnce` in the legacy `viewOnceMessage`, which current
+            // WhatsApp clients drop; build the media message ourselves and send it
+            // inside `viewOnceMessageV2` instead.
+            const { viewOnce, ...mediaPayload } = msgPayload;
+            const generated = await generateWAMessage(jid, mediaPayload, {
+                userJid: (instance.socket as any).user?.id,
+                upload: (instance.socket as any).waUploadToServer,
+                quoted: options.quoted
+            });
+            const { messageContextInfo, ...inner } = generated.message || {};
+            const wrapped: any = {
+                ...(messageContextInfo ? { messageContextInfo } : {}),
+                viewOnceMessageV2: { message: { ...inner } }
+            };
+            for (const key of ["imageMessage", "videoMessage", "audioMessage"]) {
+                if (wrapped.viewOnceMessageV2.message[key]) {
+                    wrapped.viewOnceMessageV2.message[key].viewOnce = true;
+                }
+            }
+            await instance.socket.relayMessage(jid, wrapped, { messageId: generated.key.id! });
+            sendResult = { ...generated, message: wrapped };
+        } else {
+            sendResult = await instance.socket.sendMessage(jid, msgPayload, options);
+        }
 
         // Fire webhook for sent message (non-blocking)
         try {
