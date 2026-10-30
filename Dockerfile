@@ -5,6 +5,8 @@ WORKDIR /app
 # Dependency layer — cache-friendly: only rerun when package*.json changes
 COPY package*.json ./
 COPY prisma ./prisma/
+# scripts/patch-baileys.mjs runs on postinstall
+COPY scripts ./scripts/
 RUN npm ci --legacy-peer-deps && npm cache clean --force
 
 # Source & build
