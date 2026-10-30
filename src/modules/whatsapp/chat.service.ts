@@ -333,24 +333,29 @@ export class ChatService {
         if (msgPayload.viewOnce && (msgPayload.image || msgPayload.video || msgPayload.audio)) {
             // Baileys wraps `viewOnce` in the legacy `viewOnceMessage`, which current
             // WhatsApp clients drop; build the media message ourselves and send it
-            // inside `viewOnceMessageV2` instead.
+            // inside `viewOnceMessageV2` (audio: `viewOnceMessageV2Extension`), with
+            // the `<meta view_once="true"/>` node WhatsApp Web sends (Baileys#2837).
+            // The `mediatype` on <enc> comes from scripts/patch-baileys.mjs.
             const { viewOnce, ...mediaPayload } = msgPayload;
             const generated = await generateWAMessage(jid, mediaPayload, {
                 userJid: (instance.socket as any).user?.id,
                 upload: (instance.socket as any).waUploadToServer,
                 quoted: options.quoted
             });
-            const { messageContextInfo, ...inner } = generated.message || {};
+            const { messageContextInfo, ...inner } = (generated.message || {}) as any;
+            for (const key of ["imageMessage", "videoMessage", "audioMessage"]) {
+                if (inner[key]) inner[key].viewOnce = true;
+            }
             const wrapped: any = {
                 ...(messageContextInfo ? { messageContextInfo } : {}),
-                viewOnceMessageV2: { message: { ...inner } }
+                ...(inner.audioMessage
+                    ? { viewOnceMessageV2Extension: { message: inner } }
+                    : { viewOnceMessageV2: { message: inner } })
             };
-            for (const key of ["imageMessage", "videoMessage", "audioMessage"]) {
-                if (wrapped.viewOnceMessageV2.message[key]) {
-                    wrapped.viewOnceMessageV2.message[key].viewOnce = true;
-                }
-            }
-            await instance.socket.relayMessage(jid, wrapped, { messageId: generated.key.id! });
+            await instance.socket.relayMessage(jid, wrapped, {
+                messageId: generated.key.id!,
+                additionalNodes: [{ tag: "meta", attrs: { view_once: "true" } }]
+            });
             sendResult = { ...generated, message: wrapped };
         } else {
             sendResult = await instance.socket.sendMessage(jid, msgPayload, options);
