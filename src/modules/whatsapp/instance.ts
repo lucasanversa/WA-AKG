@@ -16,9 +16,12 @@ import { bindAutoReply } from "./store/autoreply";
 import { bindPpGuard } from "./store/ppguard";
 import { antispam } from "./antispam";
 import { logger } from "@/lib/logger";
+import { alertSessionDown, disconnectReason, recordSessionEvent } from "@/lib/session-audit";
 import { isInteractiveContent, handleInteractiveMessageDispatch } from "./interactive";
 
 const MAX_RECONNECT_ATTEMPTS = 3;
+/** QR cycles that expire unscanned (~2m40s each) before the session stops instead of looping forever. */
+const MAX_QR_TIMEOUTS = 3;
 
 export class WhatsAppInstance {
     socket: WASocket | null = null;
@@ -34,6 +37,9 @@ export class WhatsAppInstance {
 
     isStopped: boolean = false;
     private reconnectCount: number = 0;
+    private qrTimeouts: number = 0;
+    private everConnected: boolean = false;
+    name: string | null = null;
     /** Called when instance auto-stops or logs out — lets manager remove it from Map */
     onRemovedFromManager: (() => void) | null = null;
 
@@ -53,6 +59,7 @@ export class WhatsAppInstance {
             return;
         }
         this.config = sessionData?.config || {};
+        this.name = sessionData.name ?? null;
         const botConfig = (sessionData as any)?.botConfig;
 
         const { state, saveCreds } = await usePrismaAuthState(this.sessionId);
@@ -68,7 +75,7 @@ export class WhatsAppInstance {
             },
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             markOnlineOnConnect: botConfig?.alwaysOnline ?? true,
-            syncFullHistory: true,
+            syncFullHistory: false,
         });
 
         // Attach Lekzo Baileys compatible helper methods
@@ -133,6 +140,10 @@ export class WhatsAppInstance {
             if (connection === "close") {
                 const code = (lastDisconnect?.error as any)?.output?.statusCode;
                 const isLoggedOut = code === DisconnectReason.loggedOut;
+                const reason = disconnectReason(lastDisconnect?.error);
+                const audit = { sessionId: this.sessionId, name: this.name, code: code ?? null, reason };
+                const qrExpired = this.status === "SCAN_QR";
+                if (qrExpired) this.qrTimeouts++;
 
                 if (isLoggedOut) {
                     // Logged out: stop permanently, remove from memory
@@ -154,6 +165,8 @@ export class WhatsAppInstance {
                         ]);
                     } catch (e) { /* ignore */ }
                     logger.success("Instance", `Session ${this.sessionId} credentials deleted.`);
+                    await recordSessionEvent({ ...audit, event: "logged_out" });
+                    if (this.everConnected) await alertSessionDown({ ...audit, event: "logged_out" });
 
                     // Remove from memory manager
                     this.onRemovedFromManager?.();
@@ -165,6 +178,7 @@ export class WhatsAppInstance {
                     this.status = "STOPPED";
                     this.socket = null;
                     this.reconnectCount = 0;
+                    this.qrTimeouts = 0;
                     this.io?.to(this.sessionId).emit("connection.update", { status: "STOPPED", qr: null });
 
                     await prisma.session.update({
@@ -172,6 +186,7 @@ export class WhatsAppInstance {
                         data: { status: "STOPPED", qr: null }
                     }).catch(() => {});
                     logger.warn("Instance", `Session ${this.sessionId} stopped. Credentials preserved.`);
+                    await recordSessionEvent({ ...audit, event: "stopped" });
 
                     // Remove from memory manager
                     const { waManager } = require("./manager");
@@ -183,7 +198,9 @@ export class WhatsAppInstance {
                 this.reconnectCount++;
                 const remaining = MAX_RECONNECT_ATTEMPTS - this.reconnectCount + 1;
 
-                if (remaining > 0) {
+                if (!qrExpired) await recordSessionEvent({ ...audit, event: "closed" });
+
+                if (remaining > 0 && this.qrTimeouts < MAX_QR_TIMEOUTS) {
                     this.status = "DISCONNECTED";
                     this.io?.to(this.sessionId).emit("connection.update", { status: "DISCONNECTED", qr: null });
                     await prisma.session.update({
@@ -198,10 +215,12 @@ export class WhatsAppInstance {
                         if (!this.isStopped) this.init();
                     }, 3000);
                 } else {
-                    // Max retries exceeded — auto-stop
+                    // Max retries exceeded (or QR left unscanned) — auto-stop
+                    const unscanned = this.qrTimeouts >= MAX_QR_TIMEOUTS;
                     this.status = "STOPPED";
                     this.socket = null;
                     this.reconnectCount = 0;
+                    this.qrTimeouts = 0;
                     this.isStopped = true; // prevent further retries
                     this.io?.to(this.sessionId).emit("connection.update", { status: "STOPPED", qr: null });
 
@@ -210,8 +229,12 @@ export class WhatsAppInstance {
                         data: { status: "STOPPED", qr: null }
                     }).catch(() => {});
                     logger.error("Instance",
-                        `Session ${this.sessionId} max reconnects (${MAX_RECONNECT_ATTEMPTS}) reached. Auto-stopped.`
+                        unscanned
+                            ? `Session ${this.sessionId} QR not scanned after ${MAX_QR_TIMEOUTS} cycles. Auto-stopped.`
+                            : `Session ${this.sessionId} max reconnects (${MAX_RECONNECT_ATTEMPTS}) reached. Auto-stopped.`
                     );
+                    await recordSessionEvent({ ...audit, event: unscanned ? "qr_expired_stopped" : "auto_stopped" });
+                    if (!unscanned && this.everConnected) await alertSessionDown({ ...audit, event: "auto_stopped" });
 
                     // Remove from memory manager
                     this.onRemovedFromManager?.();
@@ -221,6 +244,9 @@ export class WhatsAppInstance {
             if (connection === "open") {
                 // Connected — reset reconnect count
                 this.reconnectCount = 0;
+                this.qrTimeouts = 0;
+                this.everConnected = true;
+                void recordSessionEvent({ sessionId: this.sessionId, name: this.name, event: "connected" });
                 this.isStopped = false;
                 this.status = "CONNECTED";
                 this.qr = null;
