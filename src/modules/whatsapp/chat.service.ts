@@ -32,33 +32,36 @@ export class ChatService {
         limit = 50,
         before?: string,
         search?: string,
-        filter?: ChatListFilter
+        filter?: ChatListFilter,
+        beforeJid?: string
     ) {
-        // 1. Get latest message per remoteJid with cursor pagination
-        // Uses m1.timestamp < before (when provided) to load older chats
-        // Build params: [dbSessionId, dbSessionId, (before?), limit]
-        const qParams: any[] = [dbSessionId, dbSessionId];
-        if (before) qParams.push(new Date(before));
+        const qParams: (string | number | Date)[] = [dbSessionId];
+        if (before) {
+            const timestamp = new Date(before);
+            qParams.push(timestamp);
+            if (beforeJid) qParams.push(timestamp, beforeJid);
+        }
         qParams.push(limit);
 
+        // Rank before applying the cursor so an older message cannot bring a chat back on another page.
         const rawLastMessages = await prisma.$queryRawUnsafe<Array<{
             remoteJid: string;
             content: string | null;
             timestamp: Date;
             type: string;
+            fromMe: boolean | number | bigint;
         }>>(`
-            SELECT m1.remoteJid, m1.content, m1.timestamp, m1.type
-            FROM \`Message\` m1
-            INNER JOIN (
-                SELECT remoteJid, MAX(timestamp) as max_ts
+            SELECT m1.remoteJid, m1.content, m1.timestamp, m1.type, m1.fromMe
+            FROM (
+                SELECT remoteJid, content, timestamp, type, fromMe,
+                       ROW_NUMBER() OVER (PARTITION BY remoteJid ORDER BY timestamp DESC, id DESC) AS chat_rank
                 FROM \`Message\`
                 WHERE sessionId = ?
-                GROUP BY remoteJid
-            ) m2 ON m1.remoteJid = m2.remoteJid AND m1.timestamp = m2.max_ts
-            WHERE m1.sessionId = ?
-            ${before ? 'AND m1.timestamp < ?' : ''}
+            ) m1
+            WHERE m1.chat_rank = 1
+            ${before ? (beforeJid ? 'AND (m1.timestamp < ? OR (m1.timestamp = ? AND m1.remoteJid < ?))' : 'AND m1.timestamp < ?') : ''}
             ${filter && Object.hasOwn(CHAT_FILTER_SQL, filter) ? CHAT_FILTER_SQL[filter] : ''}
-            ORDER BY m1.timestamp DESC
+            ORDER BY m1.timestamp DESC, m1.remoteJid DESC
             LIMIT ?
         `, ...qParams);
 
@@ -101,7 +104,8 @@ export class ChatService {
                     timestamp: msg.timestamp instanceof Date
                         ? msg.timestamp.toISOString()
                         : String(msg.timestamp),
-                    type: msg.type
+                    type: msg.type,
+                    fromMe: Boolean(Number(msg.fromMe))
                 }
             });
         }

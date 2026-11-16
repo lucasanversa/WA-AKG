@@ -31,12 +31,22 @@ export async function GET(
             return NextResponse.json({ status: false, message: "Session not found", error: 'Session not found' }, { status: 404 });
         }
 
-        const dbSessionId = session.id;
+        const query = request.nextUrl.searchParams;
+        const before = query.get("before");
+        const beforeJid = query.get("beforeJid");
+        if ((before !== null || beforeJid !== null) &&
+            (!before || !beforeJid || beforeJid.length > 200 || !Number.isFinite(Date.parse(before)))) {
+            return NextResponse.json({ status: false, message: "Invalid chat cursor" }, { status: 400 });
+        }
 
-        // Fetch chats using the new ChatService
-        const chatList = await ChatService.getChatsList(session.id);
-
-        return NextResponse.json({ status: true, message: "Chats fetched successfully", data: chatList });
+        const limit = 50;
+        const chats = await ChatService.getChatsList(session.id, limit + 1, before ?? undefined, undefined, "all", beforeJid ?? undefined);
+        const data = chats.slice(0, limit);
+        const last = data.at(-1);
+        const nextCursor = chats.length > limit && last
+            ? { before: last.lastMessage.timestamp, beforeJid: last.jid }
+            : null;
+        return NextResponse.json({ status: true, data, nextCursor });
     } catch (error) {
         console.error("Chat API error:", error);
         return NextResponse.json({ status: false, message: "Failed to fetch chats", error: 'Failed to fetch chats' }, { status: 500 });
