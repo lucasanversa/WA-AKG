@@ -585,7 +585,17 @@ export async function onMessageReceived(sessionId: string, message: any, existin
     const normalized = extractMessageContent(message);
     const quoted = await extractQuotedMessageAsync(message, sessionId);
 
+    const content = normalizeMessageContent(message.message);
+    const ad = [
+        content?.extendedTextMessage?.contextInfo,
+        content?.imageMessage?.contextInfo,
+        content?.videoMessage?.contextInfo,
+        content?.documentMessage?.contextInfo,
+    ].map(context => context?.externalAdReply)
+        .find(reply => reply?.sourceType?.toLowerCase() === "ad" && reply.sourceId);
+
     dispatchWebhook(sessionId, "message.received", {
+        ...(ad ? { adOrigin: { id: ad.sourceId, title: ad.title } } : {}),
         key: {
             id: message.key?.id,
             remoteJid: normalizedFrom,
